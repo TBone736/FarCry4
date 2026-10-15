@@ -44,6 +44,7 @@ static struct {
     int padSlot;        /* -1 = auto */
     int hideOtherPads;
     int toggleCombo;
+    int hideNonXInput;  /* hide DirectInput / HID game controllers */
     int log;
 } g_cfg;
 
@@ -56,7 +57,7 @@ static volatile LONG g_blocking;  /* keyboard/mouse blocking currently on */
 static CRITICAL_SECTION g_cs;
 static HANDLE g_logFile = INVALID_HANDLE_VALUE;
 
-static volatile LONG c_msgKbd, c_msgMouse, c_rawKbd, c_rawMouse, c_diKbd, c_diMouse, c_async;
+static volatile LONG c_msgKbd, c_msgMouse, c_rawKbd, c_rawMouse, c_diKbd, c_diMouse, c_async, c_rawHid;
 
 static void log_msg(const char *fmt, ...)
 {
@@ -106,6 +107,7 @@ static void read_config(void)
     CFG(padSlot, "PadSlot", -1);
     CFG(hideOtherPads, "HideOtherPads", 1);
     CFG(toggleCombo, "ToggleCombo", 1);
+    CFG(hideNonXInput, "HideNonXInputPads", 1);
     CFG(log, "Log", 1);
 #undef CFG
     if (g_cfg.padSlot < -1 || g_cfg.padSlot > 3)
@@ -221,6 +223,19 @@ static void refresh_pad_slot(int force)
         return;
     g_lastProbe = now;
     if (rx.GetState) {
+        static int firstProbe = 1;
+        if (firstProbe) {
+            char found[64] = "";
+            for (i = 0; i < 4; i++)
+                if (rx.GetState(i, &st) == ERROR_SUCCESS)
+                    _snprintf(found + strlen(found), sizeof(found) - strlen(found), " %d", i);
+            if (found[0])
+                log_msg("XInput controllers connected in slot(s):%s", found);
+            else
+                log_msg("WARNING: no XInput (Xbox-style) controller detected. Check that the Legion Go "
+                        "controller is in XInput/Xbox mode in Legion Space.");
+            firstProbe = 0;
+        }
         cur = g_physSlot;
         if (rx.GetState(cur, &st) == ERROR_SUCCESS)
             chosen = cur;
@@ -415,8 +430,15 @@ typedef HRESULT(STDMETHODCALLTYPE *DIGetCaps_t)(void *, void *);
 typedef HRESULT(STDMETHODCALLTYPE *DIGetState_t)(void *, DWORD, void *);
 typedef HRESULT(STDMETHODCALLTYPE *DIGetData_t)(void *, DWORD, void *, DWORD *, DWORD);
 
-enum { VT_CREATEDEVICE = 3, VT_GETCAPS = 3, VT_GETSTATE = 9, VT_GETDATA = 10 };
-enum { KIND_NONE, KIND_KBD, KIND_MOUSE };
+enum { VT_RELEASE = 2, VT_CREATEDEVICE = 3, VT_ENUMDEVICES = 4, VT_GETCAPS = 3, VT_GETSTATE = 9, VT_GETDATA = 10 };
+enum { KIND_NONE, KIND_KBD, KIND_MOUSE, KIND_PAD };
+
+/* DI8DEVTYPE_JOYSTICK .. DI8DEVTYPE_1STPERSON: anything that is a game controller */
+static int devtype_is_pad(DWORD devType)
+{
+    BYTE t = (BYTE)(devType & 0xFF);
+    return t >= 0x14 && t <= 0x18;
+}
 
 #define MAX_VT 16
 #define MAX_DEV 32
@@ -575,9 +597,18 @@ static HRESULT STDMETHODCALLTYPE H_DICreateDevice(void *self, REFGUID g, void **
                 BYTE type = (BYTE)(caps[2] & 0xFF);
                 if (type == 0x12) kind = KIND_MOUSE;          /* DI8DEVTYPE_MOUSE */
                 else if (type == 0x13) kind = KIND_KBD;       /* DI8DEVTYPE_KEYBOARD */
+                else if (devtype_is_pad(caps[2])) kind = KIND_PAD;
+                log_msg("DirectInput device created, type 0x%02X", type);
             }
         }
-        dev_set(dev, kind);
+        if (kind == KIND_PAD && g_cfg.hideNonXInput) {
+            /* Make the game fall back to XInput, which has the proper Xbox layout. */
+            ((ULONG(STDMETHODCALLTYPE *)(void *))(*(void ***)dev)[VT_RELEASE])(dev);
+            *out = NULL;
+            log_msg("Hid a DirectInput game controller from the game (forcing XInput / Xbox layout)");
+            return REGDB_E_CLASSNOTREG; /* DIERR_DEVICENOTREG */
+        }
+        dev_set(dev, kind == KIND_PAD ? KIND_NONE : kind);
         if (kind != KIND_NONE) {
             vt_patch(dev, VT_GETSTATE, (void *)H_DIGetDeviceState);
             vt_patch(dev, VT_GETDATA, (void *)H_DIGetDeviceData);
@@ -588,9 +619,37 @@ static HRESULT STDMETHODCALLTYPE H_DICreateDevice(void *self, REFGUID g, void **
     return hr;
 }
 
+typedef BOOL(CALLBACK *DIEnumCb_t)(const void *inst, void *ref);
+typedef HRESULT(STDMETHODCALLTYPE *DIEnumDevices_t)(void *, DWORD, DIEnumCb_t, void *, DWORD);
+typedef struct { DIEnumCb_t cb; void *ref; } EnumCtx;
+
+static BOOL CALLBACK enum_filter_cb(const void *inst, void *ref)
+{
+    EnumCtx *ctx = (EnumCtx *)ref;
+    /* DIDEVICEINSTANCE{A,W}: dwSize, guidInstance, guidProduct, dwDevType */
+    DWORD devType = *(const DWORD *)((const BYTE *)inst + 4 + 2 * sizeof(GUID));
+    if (g_cfg.hideNonXInput && devtype_is_pad(devType))
+        return TRUE; /* DIENUM_CONTINUE: skip it */
+    return ctx->cb(inst, ctx->ref);
+}
+
+static HRESULT STDMETHODCALLTYPE H_DIEnumDevices(void *self, DWORD type, DIEnumCb_t cb, void *ref, DWORD flags)
+{
+    DIEnumDevices_t orig = (DIEnumDevices_t)vt_orig(self, VT_ENUMDEVICES);
+    EnumCtx ctx;
+    if (!orig)
+        return E_FAIL;
+    if (!cb || !g_cfg.hideNonXInput)
+        return orig(self, type, cb, ref, flags);
+    ctx.cb = cb;
+    ctx.ref = ref;
+    return orig(self, type, enum_filter_cb, &ctx, flags);
+}
+
 static void hook_dinput_object(void *di)
 {
     vt_patch(di, VT_CREATEDEVICE, (void *)H_DICreateDevice);
+    vt_patch(di, VT_ENUMDEVICES, (void *)H_DIEnumDevices);
 }
 
 HRESULT WINAPI FP_DirectInput8Create(HINSTANCE inst, DWORD ver, REFIID riid, LPVOID *out, void *outer)
@@ -698,6 +757,10 @@ static void scrub_raw(RAWINPUT *ri)
         ri->data.keyboard.VKey = 0xFF; /* "no key" */
         ri->data.keyboard.Message = WM_KEYUP;
         InterlockedIncrement(&c_rawKbd);
+    } else if (ri->header.dwType == RIM_TYPEHID && g_cfg.enabled && g_cfg.hideNonXInput) {
+        /* Raw HID reports from game controllers (non-Xbox layout): drop them. */
+        ri->data.hid.dwCount = 0;
+        InterlockedIncrement(&c_rawHid);
     }
 }
 
@@ -946,7 +1009,8 @@ static int raw_is_blocked(HRAWINPUT h)
     UINT sz = sizeof(hdr);
     if (!o_GetRawInputData || o_GetRawInputData(h, RID_HEADER, &hdr, &sz, sizeof(RAWINPUTHEADER)) == (UINT)-1)
         return 0;
-    return (hdr.dwType == RIM_TYPEMOUSE && block_mouse()) || (hdr.dwType == RIM_TYPEKEYBOARD && block_kbd());
+    return (hdr.dwType == RIM_TYPEMOUSE && block_mouse()) || (hdr.dwType == RIM_TYPEKEYBOARD && block_kbd()) ||
+           (hdr.dwType == RIM_TYPEHID && g_cfg.hideNonXInput);
 }
 
 static LRESULT CALLBACK SubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -1046,10 +1110,10 @@ static DWORD WINAPI worker(LPVOID p)
             LONG a = InterlockedExchange(&c_msgKbd, 0), b = InterlockedExchange(&c_msgMouse, 0);
             LONG c = InterlockedExchange(&c_rawKbd, 0), d = InterlockedExchange(&c_rawMouse, 0);
             LONG e = InterlockedExchange(&c_diKbd, 0), f = InterlockedExchange(&c_diMouse, 0);
-            LONG g = InterlockedExchange(&c_async, 0);
-            if (a | b | c | d | e | f | g)
+            LONG g = InterlockedExchange(&c_async, 0), hh = InterlockedExchange(&c_rawHid, 0);
+            if (a | b | c | d | e | f | g | hh)
                 log_msg("Blocked in last 30s: msg kbd=%ld mouse=%ld | raw kbd=%ld mouse=%ld | "
-                        "dinput kbd=%ld mouse=%ld | keystate=%ld", a, b, c, d, e, f, g);
+                        "dinput kbd=%ld mouse=%ld | keystate=%ld | raw hid pad=%ld", a, b, c, d, e, f, g, hh);
             lastReport = now;
         }
         Sleep(now - start < 60000 ? 500 : 2000);
@@ -1105,8 +1169,8 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
     g_blocking = 1;
     log_msg("FC4 ForcePad loaded as %s in %s", g_selfName, path);
     log_msg("Config: BlockKeyboard=%d BlockMouse=%d FreezeCursor=%d ParkCursor=%d PadSlot=%d "
-            "HideOtherPads=%d ToggleCombo=%d", g_cfg.blockKeyboard, g_cfg.blockMouse,
-            g_cfg.freezeCursor, g_cfg.parkCursor, g_cfg.padSlot, g_cfg.hideOtherPads, g_cfg.toggleCombo);
+            "HideOtherPads=%d ToggleCombo=%d HideNonXInputPads=%d", g_cfg.blockKeyboard, g_cfg.blockMouse,
+            g_cfg.freezeCursor, g_cfg.parkCursor, g_cfg.padSlot, g_cfg.hideOtherPads, g_cfg.toggleCombo, g_cfg.hideNonXInput);
 
     /* Patch the exe right away (no LoadLibrary under the loader lock), then keep
        re-checking from a worker thread for late-loaded modules / unpacked imports. */

@@ -13,6 +13,8 @@ back to keyboard/mouse mode.
 - **Makes your controller player 1.** If Windows put the built-in controller in XInput slot 2–4,
   or a virtual pad from Steam or Legion Space grabbed slot 1, the game would ignore your real
   controller. The mod shows the game the first *connected* controller as slot 1.
+- **Forces the Xbox button layout.** Hides "generic" DirectInput/HID versions of the controller,
+  so the game can't read it with a scrambled layout (A acting as up, X as right, and so on).
 - **Freezes and parks the mouse cursor**, so a cursor in the middle of the screen can't steal focus in menus.
 - **Toggle while playing:** hold **LB + RB + View** (the two-squares button) for 1.5 s to switch
   the keyboard/mouse blocking on or off. You'll hear a beep.
@@ -47,6 +49,7 @@ try again. Use only one name at a time. The same DLL works under any of these na
 | `ParkCursor` | 1 | Move the cursor to the bottom-right corner on start |
 | `PadSlot` | -1 | -1 = auto. 0–3 forces a specific XInput slot |
 | `HideOtherPads` | 1 | Show the game only one controller |
+| `HideNonXInputPads` | 1 | Hide DirectInput/HID controllers so the game uses the Xbox (XInput) layout |
 | `ToggleCombo` | 1 | Enable the LB+RB+View toggle |
 | `Log` | 1 | Write `ForcePad.log` |
 
